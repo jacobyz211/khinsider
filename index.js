@@ -1,17 +1,21 @@
 /**
  * Eclipse Music addon — KHInsider (downloads.khinsider.com)
  *
- * ROOT CAUSE FOUND (per eclipsemusic.app/docs schema):
- * Track objects require id, title, AND artist. Album track objects
- * were missing "artist" entirely, and sent "trackNumber" (not part of
- * the spec) and format: "audio" (not a valid value — spec only
- * recognizes mp3/flac/aac/m4a). A track object missing a required
- * field is almost certainly why Eclipse rejected the whole album as
- * "couldn't load" even though the JSON looked reasonable to a human.
- *
- * Fixed: every track object in the album response now includes
- * artist (mirrors the album-level artist), and drops the
- * non-spec fields entirely rather than sending invalid values.
+ * THIS VERSION:
+ * 1. "artist" is no longer a fixed "Various / Game OST" placeholder.
+ *    KHInsider's own metadata block (visible on every album page)
+ *    includes an "Album type:" field (Gamerip / Soundtrack / Arrange /
+ *    Remix / etc.) and a "Platforms:" field. We extract those directly
+ *    and use them as the artist value — e.g. "Gamerip (Windows)" —
+ *    which is exactly what KHInsider itself displays. Falls back to a
+ *    generic label only if neither is found.
+ * 2. Track duration is now extracted from the mm:ss time text already
+ *    present in each track's table row (previously ignored — only the
+ *    audio-file anchor was read), converted to seconds per the
+ *    Eclipse schema.
+ * 3. Search result previews reuse the SAME page fetch to get cover +
+ *    album type together — no extra request needed beyond what was
+ *    already being fetched for the cover.
  *
  * Deploy: wrangler deploy
  * Secrets (optional): wrangler secret put UPSTASH_REDIS_REST_URL
@@ -23,15 +27,14 @@ import { Redis } from "@upstash/redis/cloudflare";
 const BASE_URL = "https://downloads.khinsider.com";
 const FETCH_TIMEOUT_MS = 4000;
 const PREVIEW_TIMEOUT_MS = 3000;
-const PREVIEW_COVER_COUNT = 6;
+const PREVIEW_COUNT = 6;
 
 const CACHE_TTL_SEARCH = 60 * 15;
 const CACHE_TTL_ALBUM = 60 * 60 * 6;
 
-const ALBUM_ARTIST = "Various / Game OST";
-
 const AUDIO_EXT_RE = /\.(mp3|flac|ogg)(\?[^"]*)?$/i;
 const DIRECT_FILE_RE = /^https?:\/\/[^\/]+\/(?:soundtracks|ost)\/.+$/i;
+const DURATION_RE = /\b(\d{1,2}):(\d{2})\b/;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -79,6 +82,12 @@ function titleFromSongUrl(href) {
   }
   filename = filename.replace(/^\[TRACK\]-?/i, "").replace(/^[-\s]+/, "").trim();
   return filename;
+}
+
+function durationToSeconds(text) {
+  const m = DURATION_RE.exec(text);
+  if (!m) return undefined;
+  return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
 }
 
 async function fetchHtml(path, timeoutMs = FETCH_TIMEOUT_MS) {
@@ -145,6 +154,34 @@ function extractCoverUrl(html) {
   return plain ? plain[1] : "";
 }
 
+/**
+ * KHInsider's metadata block shows labeled facts like:
+ *   Album type: Gamerip
+ *   Platforms: Windows
+ * Extracted generically: find "Label:" then capture text up to the
+ * next known label or a reasonable length cap.
+ */
+const METADATA_LABELS = ["Album type", "Platforms", "Year", "Developed by", "Published by", "Catalog Number", "Number of Files", "Total Filesize", "Date Added"];
+
+function extractMetadataField(plainText, label) {
+  const labelAlternation = METADATA_LABELS.map((l) => l.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const re = new RegExp(`${label}:\\s*(.*?)(?=\\s(?:${labelAlternation}):|$)`, "i");
+  const m = re.exec(plainText);
+  return m ? m[1].trim().replace(/\s{2,}/g, " ") : "";
+}
+
+function deriveAlbumArtist(scopedHtml) {
+  // Metadata block sits before the track table — take a generous
+  // leading slice as plain text rather than trying to bound it exactly.
+  const plainText = stripTags(scopedHtml.slice(0, 4000));
+  const albumType = extractMetadataField(plainText, "Album type");
+  const platforms = extractMetadataField(plainText, "Platforms");
+  if (albumType && platforms) return `${albumType} (${platforms})`;
+  if (albumType) return albumType;
+  if (platforms) return platforms;
+  return "Game Soundtrack";
+}
+
 /* ------------------------------------------------------------------ */
 /* Search                                                               */
 /* ------------------------------------------------------------------ */
@@ -205,29 +242,35 @@ async function handleSearch(query) {
     }
   }
 
-  const toFetchCover = rawAlbums.slice(0, PREVIEW_COVER_COUNT);
-  const covers = await Promise.allSettled(toFetchCover.map((a) => fetchAlbumCoverOnly(a.id)));
+  const toPreview = rawAlbums.slice(0, PREVIEW_COUNT);
+  const previews = await Promise.allSettled(toPreview.map((a) => fetchAlbumPreview(a.id)));
 
-  const albums = rawAlbums.map((a, i) => ({
-    id: a.id,
-    title: a.title,
-    artist: ALBUM_ARTIST,
-    artworkURL: i < PREVIEW_COVER_COUNT && covers[i].status === "fulfilled" ? covers[i].value : "",
-  }));
+  const albums = rawAlbums.map((a, i) => {
+    const preview = i < PREVIEW_COUNT && previews[i].status === "fulfilled" ? previews[i].value : null;
+    return {
+      id: a.id,
+      title: a.title,
+      artist: preview ? preview.artist : "Game Soundtrack",
+      artworkURL: preview ? preview.artworkURL : "",
+    };
+  });
 
   return { albums, tracks: [], artists: [], playlists: [] };
 }
 
-async function fetchAlbumCoverOnly(albumId) {
+/** One fetch, reused for both cover art and the real album-type artist string. */
+async function fetchAlbumPreview(albumId) {
   const { html } = await fetchHtml(`/game-soundtracks/album/${albumId}`, PREVIEW_TIMEOUT_MS);
   const contentIdx = html.indexOf('id="pageContent"');
   const scoped = contentIdx >= 0 ? html.slice(contentIdx) : html;
   const firstTableMatch = scoped.match(/<table[^>]*>[\s\S]*?<\/table>/);
-  return firstTableMatch ? extractCoverUrl(firstTableMatch[0]) : extractCoverUrl(scoped);
+  const artworkURL = firstTableMatch ? extractCoverUrl(firstTableMatch[0]) : extractCoverUrl(scoped);
+  const artist = deriveAlbumArtist(scoped);
+  return { artworkURL, artist };
 }
 
 /* ------------------------------------------------------------------ */
-/* Album — every track carries the required id/title/artist fields    */
+/* Album — real artist string, durations, required id/title/artist     */
 /* ------------------------------------------------------------------ */
 
 function parseAlbumTracks(scopedHtml) {
@@ -247,11 +290,14 @@ function parseAlbumTracks(scopedHtml) {
     const title = (visibleText && visibleText.trim()) || titleFromSongUrl(songPath);
     if (!title) continue;
 
-    // id, title, artist are all REQUIRED per the Eclipse addon schema.
+    const rowText = stripTags(row);
+    const duration = durationToSeconds(rowText);
+
     tracks.push({
       id: encodeTrackId(songPath),
       title,
-      artist: ALBUM_ARTIST,
+      artist: "", // filled in from the album-level artist by the caller
+      ...(duration !== undefined ? { duration } : {}),
     });
   }
 
@@ -273,12 +319,13 @@ function parseAlbumPage(html, albumId) {
   const firstTableMatch = scoped.match(/<table[^>]*>[\s\S]*?<\/table>/);
   const artworkURL = firstTableMatch ? extractCoverUrl(firstTableMatch[0]) : extractCoverUrl(scoped);
 
-  const tracks = parseAlbumTracks(scoped);
+  const artist = deriveAlbumArtist(scoped);
+  const tracks = parseAlbumTracks(scoped).map((t) => ({ ...t, artist }));
 
   return {
     id: albumId,
     title,
-    artist: ALBUM_ARTIST,
+    artist,
     artworkURL,
     trackCount: tracks.length,
     tracks,
@@ -366,7 +413,7 @@ function manifest(token) {
   return {
     id: token ? `com.eclipse-addons.khinsider.${token}` : "com.eclipse-addons.khinsider",
     name: "KHInsider",
-    version: "1.7.0",
+    version: "1.8.0",
     description: "Video game soundtracks from downloads.khinsider.com — MP3, FLAC, and OGG rips.",
     icon: "https://downloads.khinsider.com/favicon.ico",
     resources: ["search", "stream", "catalog"],
