@@ -1,24 +1,17 @@
 /**
  * Eclipse Music addon — KHInsider (downloads.khinsider.com)
  *
- * FIXES THIS VERSION (based on decoding real production output):
- * 1. Titles were "&nbsp;" for every track because I was reading the
- *    first table cell (a spacer/index column), not the actual track
- *    name. Fixed: track titles are now derived directly from the
- *    song-page URL's filename slug — e.g. ".../%5BTRACK%5D-Boss.mp3"
- *    decodes (it's multiply percent-encoded) to "Boss", which is
- *    exactly the real track name. This is more reliable than fighting
- *    over which table cell/anchor holds visible text.
- * 2. Links ending in .mp3/.flac/.ogg on the album page are NOT direct
- *    CDN files — they're still pages on downloads.khinsider.com with
- *    an audio-looking filename slug. Streaming needs the two-hop
- *    resolution after all: /stream/:id decodes the song-page path,
- *    fetches THAT page, and extracts the real direct file link
- *    (hosted on a CDN like vgmtreasurechest.com, matching the domain
- *    pattern the cover art already confirmed works).
- * 3. Cover art extraction (which now confirmed works) is applied to
- *    the top few search results too, so search list thumbnails aren't
- *    blank anymore.
+ * ROOT CAUSE FOUND (per eclipsemusic.app/docs schema):
+ * Track objects require id, title, AND artist. Album track objects
+ * were missing "artist" entirely, and sent "trackNumber" (not part of
+ * the spec) and format: "audio" (not a valid value — spec only
+ * recognizes mp3/flac/aac/m4a). A track object missing a required
+ * field is almost certainly why Eclipse rejected the whole album as
+ * "couldn't load" even though the JSON looked reasonable to a human.
+ *
+ * Fixed: every track object in the album response now includes
+ * artist (mirrors the album-level artist), and drops the
+ * non-spec fields entirely rather than sending invalid values.
  *
  * Deploy: wrangler deploy
  * Secrets (optional): wrangler secret put UPSTASH_REDIS_REST_URL
@@ -34,6 +27,8 @@ const PREVIEW_COVER_COUNT = 6;
 
 const CACHE_TTL_SEARCH = 60 * 15;
 const CACHE_TTL_ALBUM = 60 * 60 * 6;
+
+const ALBUM_ARTIST = "Various / Game OST";
 
 const AUDIO_EXT_RE = /\.(mp3|flac|ogg)(\?[^"]*)?$/i;
 const DIRECT_FILE_RE = /^https?:\/\/[^\/]+\/(?:soundtracks|ost)\/.+$/i;
@@ -70,11 +65,6 @@ function stripTags(html) {
   return decodeEntities(html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
 }
 
-/**
- * Track titles come from the song-page URL's filename slug, which is
- * reliably present even when the visible cell text is just a spacer.
- * The slug is often multiply percent-encoded (e.g. %255B = %5B = "[").
- */
 function titleFromSongUrl(href) {
   let filename = href.split("/").pop() || "";
   filename = filename.replace(/\.(mp3|flac|ogg)(\?.*)?$/i, "");
@@ -109,7 +99,7 @@ async function fetchHtml(path, timeoutMs = FETCH_TIMEOUT_MS) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Track id encoding — the SONG PAGE path (still needs a second hop)   */
+/* Track id encoding — the song-page path (needs a second hop)         */
 /* ------------------------------------------------------------------ */
 
 function encodeTrackId(songPath) {
@@ -156,7 +146,7 @@ function extractCoverUrl(html) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Search — strict table parse first, loose anchor scan as fallback    */
+/* Search                                                               */
 /* ------------------------------------------------------------------ */
 
 function parseAlbumListTable(tableHtml) {
@@ -215,15 +205,13 @@ async function handleSearch(query) {
     }
   }
 
-  // Fetch real covers for the top few results so search thumbnails
-  // aren't blank. Cheap: only grabs the cover, not the full track list.
   const toFetchCover = rawAlbums.slice(0, PREVIEW_COVER_COUNT);
   const covers = await Promise.allSettled(toFetchCover.map((a) => fetchAlbumCoverOnly(a.id)));
 
   const albums = rawAlbums.map((a, i) => ({
     id: a.id,
     title: a.title,
-    artist: "Various / Game OST",
+    artist: ALBUM_ARTIST,
     artworkURL: i < PREVIEW_COVER_COUNT && covers[i].status === "fulfilled" ? covers[i].value : "",
   }));
 
@@ -239,14 +227,13 @@ async function fetchAlbumCoverOnly(albumId) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Album — track titles from URL slug, ids encode the song-page path   */
+/* Album — every track carries the required id/title/artist fields    */
 /* ------------------------------------------------------------------ */
 
 function parseAlbumTracks(scopedHtml) {
   const rows = scopedHtml.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || [];
   const tracks = [];
   const seenPaths = new Set();
-  let index = 1;
 
   for (const row of rows) {
     const anchors = allAnchors(row).filter((a) => AUDIO_EXT_RE.test(a.href));
@@ -256,18 +243,15 @@ function parseAlbumTracks(scopedHtml) {
     if (seenPaths.has(songPath)) continue;
     seenPaths.add(songPath);
 
-    // Prefer real visible anchor text if it looks like an actual title;
-    // otherwise derive it from the URL slug (reliable even when the
-    // cell text is just a spacer, which is what we saw in practice).
     const visibleText = anchors.find((a) => a.text && a.text.trim() && a.text.trim() !== "&nbsp;")?.text;
     const title = (visibleText && visibleText.trim()) || titleFromSongUrl(songPath);
     if (!title) continue;
 
+    // id, title, artist are all REQUIRED per the Eclipse addon schema.
     tracks.push({
       id: encodeTrackId(songPath),
       title,
-      trackNumber: index++,
-      format: "audio",
+      artist: ALBUM_ARTIST,
     });
   }
 
@@ -294,7 +278,7 @@ function parseAlbumPage(html, albumId) {
   return {
     id: albumId,
     title,
-    artist: "Various / Game OST",
+    artist: ALBUM_ARTIST,
     artworkURL,
     trackCount: tracks.length,
     tracks,
@@ -307,7 +291,7 @@ async function handleAlbum(albumId) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Stream — TWO-HOP resolution: song page path -> real direct file URL */
+/* Stream — two-hop resolution: song page path -> real direct file URL */
 /* ------------------------------------------------------------------ */
 
 async function handleStream(trackId) {
@@ -326,7 +310,9 @@ async function handleStream(trackId) {
     directLinks[0];
 
   const extMatch = preferred.match(/\.(mp3|flac|ogg)(\?.*)?$/i);
-  return { url: preferred, format: extMatch ? extMatch[1].toLowerCase() : "mp3", quality: "native" };
+  const format = extMatch ? extMatch[1].toLowerCase() : "mp3";
+
+  return { url: preferred, format, quality: "native" };
 }
 
 /* ------------------------------------------------------------------ */
@@ -380,7 +366,7 @@ function manifest(token) {
   return {
     id: token ? `com.eclipse-addons.khinsider.${token}` : "com.eclipse-addons.khinsider",
     name: "KHInsider",
-    version: "1.6.0",
+    version: "1.7.0",
     description: "Video game soundtracks from downloads.khinsider.com — MP3, FLAC, and OGG rips.",
     icon: "https://downloads.khinsider.com/favicon.ico",
     resources: ["search", "stream", "catalog"],
