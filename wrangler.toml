@@ -1,0 +1,15 @@
+name = "eclipse-khinsider-addon"
+main = "index.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["global_fetch_strictly_public"]
+
+[observability]
+enabled = true
+
+[placement]
+mode = "smart"
+
+# Optional: attach a custom route once you have a domain on Cloudflare
+# [[routes]]
+# pattern = "khinsider-addon.yourdomain.com/*"
+# zone_name = "yourdomain.com"
