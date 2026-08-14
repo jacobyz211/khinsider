@@ -1,20 +1,18 @@
 /**
  * Eclipse Music addon — KHInsider (downloads.khinsider.com)
  *
- * Selectors verified against the actively-maintained reference scraper
- * (obskyr/khinsider) rather than guessed:
- *  - Search results: <table class="albumList"> rows, SECOND <td> holds
- *    the album anchor (first row is the header, skipped).
- *  - Cover art: the ANCHOR HREF wrapping an <img> in the first <table>
- *    inside #pageContent — not the <img src>, which is a low-res thumb.
- *  - Album existence: #pageContent's first <p> text === "No such album".
- *  - Song list: table#songlist rows, skip rows containing <th>.
- *  - Song page file links: anchors matching
- *    ^https?://[^/]+/(?:soundtracks|ost)/.+$
- *
- * NEW: search results now include a lightweight preview (real cover +
- * top 3 track titles) for the first few albums, fetched concurrently,
- * so search feels less like a blind list of titles.
+ * SEARCH FIX (this version):
+ * The previous version's table-matching regex required class="albumList"
+ * as an EXACT attribute value. If the real page has multiple classes
+ * (e.g. class="albumList clickable") or different attribute ordering,
+ * that regex silently matches nothing — which is almost certainly why
+ * results disappeared entirely. Fixed to:
+ *   1. Match class attributes containing "albumList" anywhere in the
+ *      value, not just as an exact match.
+ *   2. Fall back to a looser site-wide anchor scan (matching any link
+ *      to /game-soundtracks/album/<id> with text) if the strict table
+ *      parse comes back empty — so a markup mismatch degrades to
+ *      "less precise" instead of "zero results."
  *
  * Deploy: wrangler deploy
  * Secrets (optional): wrangler secret put UPSTASH_REDIS_REST_URL
@@ -26,7 +24,7 @@ import { Redis } from "@upstash/redis/cloudflare";
 const BASE_URL = "https://downloads.khinsider.com";
 const FETCH_TIMEOUT_MS = 4000;
 const PREVIEW_TIMEOUT_MS = 3000;
-const PREVIEW_COUNT = 5; // how many top search results get cover + track preview
+const PREVIEW_COUNT = 5;
 
 const CACHE_TTL_SEARCH = 60 * 15;
 const CACHE_TTL_ALBUM = 60 * 60 * 6;
@@ -97,7 +95,7 @@ function decodeTrackId(id) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Small HTML helpers used by both search and album parsing            */
+/* Small HTML helpers                                                   */
 /* ------------------------------------------------------------------ */
 
 function extractTdCells(rowHtml) {
@@ -114,26 +112,19 @@ function firstAnchor(html) {
   return { href: m[1], text: stripTags(m[2]) };
 }
 
-/**
- * The cover thumbnail on KHInsider is an <a> wrapping an <img> — the
- * HREF is the full-size image, the <img src> is just a low-res thumb.
- * Finds the first such anchor within a given HTML fragment.
- */
 function extractCoverHref(html) {
-  const anchorRe = /<a[^>]+href="([^"]+)"[^>]*>\s*<img\b/g;
-  const m = anchorRe.exec(html);
+  const m = /<a[^>]+href="([^"]+)"[^>]*>\s*<img\b/.exec(html);
   return m ? m[1] : undefined;
 }
 
 /* ------------------------------------------------------------------ */
-/* Search                                                               */
+/* Search — strict table parse first, loose anchor scan as fallback    */
 /* ------------------------------------------------------------------ */
 
 function parseAlbumListTable(tableHtml) {
   const rows = tableHtml.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || [];
   const albums = [];
-  // Skip the header row (index 0), per the verified reference scraper.
-  for (let i = 1; i < rows.length; i++) {
+  for (let i = 1; i < rows.length; i++) { // skip header row
     const cells = extractTdCells(rows[i]);
     if (cells.length < 2) continue;
     const anchor = firstAnchor(cells[1]);
@@ -146,18 +137,36 @@ function parseAlbumListTable(tableHtml) {
   return albums;
 }
 
+/** Fallback: scan the whole page for any album link, no table structure assumed. */
+function parseAlbumLinksLoose(html) {
+  const albums = [];
+  const seen = new Set();
+  const anchorRe = /<a[^>]+href="([^"]*\/game-soundtracks\/album\/([^"\/?#]+))"[^>]*>([\s\S]*?)<\/a>/g;
+  let m;
+  while ((m = anchorRe.exec(html)) !== null) {
+    const id = m[2];
+    const title = stripTags(m[3]);
+    if (!title || seen.has(id)) continue;
+    seen.add(id);
+    albums.push({ id, title });
+  }
+  return albums;
+}
+
 async function handleSearch(query) {
   if (!query) return { albums: [], tracks: [], artists: [], playlists: [] };
 
   const { html, finalUrl } = await fetchHtml(`/search?search=${encodeURIComponent(query)}`);
 
-  // Exact single match redirects straight to the album page.
   const redirectMatch = finalUrl.match(/\/game-soundtracks\/album\/([^\/?#]+)/);
   let albums = [];
+
   if (redirectMatch) {
     albums = [{ id: redirectMatch[1], title: query }];
   } else {
-    const tables = html.match(/<table[^>]+class="albumList"[\s\S]*?<\/table>/g) || [];
+    // Class attribute may contain extra classes or different attribute
+    // ordering — match "albumList" appearing anywhere in class="...".
+    const tables = html.match(/<table\b[^>]*\bclass="[^"]*albumList[^"]*"[^>]*>[\s\S]*?<\/table>/g) || [];
     const seen = new Set();
     for (const table of tables) {
       for (const a of parseAlbumListTable(table)) {
@@ -166,10 +175,13 @@ async function handleSearch(query) {
         albums.push(a);
       }
     }
+    // Strict table parse found nothing (markup mismatch) — degrade
+    // gracefully to a loose site-wide scan instead of zero results.
+    if (albums.length === 0) {
+      albums = parseAlbumLinksLoose(html);
+    }
   }
 
-  // Preview enrichment: fetch real cover + top 3 tracks for the first
-  // few results, concurrently, so search doesn't feel like a blind list.
   const toPreview = albums.slice(0, PREVIEW_COUNT);
   const previews = await Promise.allSettled(toPreview.map((a) => fetchAlbumPreview(a.id)));
 
@@ -184,11 +196,6 @@ async function handleSearch(query) {
   return { albums: enriched, tracks: [], artists: [], playlists: [] };
 }
 
-/**
- * Lightweight version of the album fetch used only for search preview —
- * grabs the cover and the first 3 track titles without resolving any
- * stream URLs (which would require a further fetch per track).
- */
 async function fetchAlbumPreview(albumId) {
   const { html } = await fetchHtml(`/game-soundtracks/album/${albumId}`, PREVIEW_TIMEOUT_MS);
   const contentIdx = html.indexOf('id="pageContent"');
@@ -197,7 +204,7 @@ async function fetchAlbumPreview(albumId) {
   const firstTableMatch = scoped.match(/<table[^>]*>[\s\S]*?<\/table>/);
   const artworkURL = firstTableMatch ? extractCoverHref(firstTableMatch[0]) : undefined;
 
-  const songlistMatch = scoped.match(/<table[^>]+id="songlist"[\s\S]*?<\/table>/i);
+  const songlistMatch = scoped.match(/<table\b[^>]*\bid="songlist"[^>]*>[\s\S]*?<\/table>/i);
   const rows = songlistMatch ? (songlistMatch[0].match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || []) : [];
   const previewTracks = [];
   for (const row of rows) {
@@ -229,7 +236,7 @@ function parseAlbumPage(html, albumId) {
   const firstTableMatch = scoped.match(/<table[^>]*>[\s\S]*?<\/table>/);
   const artworkURL = firstTableMatch ? extractCoverHref(firstTableMatch[0]) : undefined;
 
-  const songlistMatch = scoped.match(/<table[^>]+id="songlist"[\s\S]*?<\/table>/i);
+  const songlistMatch = scoped.match(/<table\b[^>]*\bid="songlist"[^>]*>[\s\S]*?<\/table>/i);
   const songlistHtml = songlistMatch ? songlistMatch[0] : "";
   const rows = songlistHtml.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || [];
 
@@ -331,7 +338,7 @@ function manifest(token) {
   return {
     id: token ? `com.eclipse-addons.khinsider.${token}` : "com.eclipse-addons.khinsider",
     name: "KHInsider",
-    version: "1.1.0",
+    version: "1.2.0",
     description: "Video game soundtracks from downloads.khinsider.com — MP3, FLAC, and OGG rips.",
     icon: "https://downloads.khinsider.com/favicon.ico",
     resources: ["search", "stream", "catalog"],
