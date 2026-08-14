@@ -1,28 +1,24 @@
 /**
  * Eclipse Music addon — KHInsider (downloads.khinsider.com)
  *
- * MAJOR FIX THIS VERSION:
- * The original reference scraper (obskyr/khinsider, 2014) assumed a
- * two-hop structure: album page -> per-song page -> direct file link.
- * A live fetch of a current album page shows that's outdated — modern
- * KHInsider embeds the direct MP3/FLAC download links INLINE in the
- * track table itself (icon buttons), with no separate song page
- * required at all. Relying on a specific table id/class to find those
- * rows was fragile and kept coming back empty.
- *
- * New approach — format-driven, not structure-driven:
- *  - Scan the WHOLE album page for <tr> rows that contain an anchor
- *    whose href ends in .mp3/.flac/.ogg (any table, any id/class).
- *  - Track title = that row's first table cell, stripped of tags and
- *    known icon-ligature leftover tokens.
- *  - The row's matching file links ARE the direct, final audio URLs —
- *    no second fetch needed at all. The "track id" now encodes the
- *    real file URL directly, so /stream/:id is instant (just a
- *    base64 decode, no network call).
- *  - Cover art extraction now tries anchor-wrapped-<img> first, then
- *    falls back to any plain <img src> in the content region if no
- *    wrapping anchor is found — the redesign may not wrap the cover
- *    in a link at all.
+ * FIXES THIS VERSION (based on decoding real production output):
+ * 1. Titles were "&nbsp;" for every track because I was reading the
+ *    first table cell (a spacer/index column), not the actual track
+ *    name. Fixed: track titles are now derived directly from the
+ *    song-page URL's filename slug — e.g. ".../%5BTRACK%5D-Boss.mp3"
+ *    decodes (it's multiply percent-encoded) to "Boss", which is
+ *    exactly the real track name. This is more reliable than fighting
+ *    over which table cell/anchor holds visible text.
+ * 2. Links ending in .mp3/.flac/.ogg on the album page are NOT direct
+ *    CDN files — they're still pages on downloads.khinsider.com with
+ *    an audio-looking filename slug. Streaming needs the two-hop
+ *    resolution after all: /stream/:id decodes the song-page path,
+ *    fetches THAT page, and extracts the real direct file link
+ *    (hosted on a CDN like vgmtreasurechest.com, matching the domain
+ *    pattern the cover art already confirmed works).
+ * 3. Cover art extraction (which now confirmed works) is applied to
+ *    the top few search results too, so search list thumbnails aren't
+ *    blank anymore.
  *
  * Deploy: wrangler deploy
  * Secrets (optional): wrangler secret put UPSTASH_REDIS_REST_URL
@@ -33,16 +29,14 @@ import { Redis } from "@upstash/redis/cloudflare";
 
 const BASE_URL = "https://downloads.khinsider.com";
 const FETCH_TIMEOUT_MS = 4000;
+const PREVIEW_TIMEOUT_MS = 3000;
+const PREVIEW_COVER_COUNT = 6;
 
 const CACHE_TTL_SEARCH = 60 * 15;
 const CACHE_TTL_ALBUM = 60 * 60 * 6;
 
-const FORMAT_PREFERENCE = ["flac", "ogg", "mp3"];
 const AUDIO_EXT_RE = /\.(mp3|flac|ogg)(\?[^"]*)?$/i;
-
-// Known Material-Icon ligature words that can leak into title text
-// when an icon element's text content gets stripped as plain text.
-const ICON_LIGATURE_WORDS = ["get_app", "playlist_add", "audiotrack", "music_note", "file_download", "download", "play_arrow"];
+const DIRECT_FILE_RE = /^https?:\/\/[^\/]+\/(?:soundtracks|ost)\/.+$/i;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -68,6 +62,7 @@ function decodeEntities(str) {
     .replace(/&apos;/g, "'")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ")
     .trim();
 }
 
@@ -75,14 +70,25 @@ function stripTags(html) {
   return decodeEntities(html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
 }
 
-function cleanTrackTitle(rawTitle) {
-  let t = rawTitle;
-  t = t.replace(/\[[A-Z_]+\]/g, " "); // bracketed placeholders like [TRACK]
-  for (const word of ICON_LIGATURE_WORDS) {
-    t = t.replace(new RegExp(`\\b${word}\\b`, "gi"), " ");
+/**
+ * Track titles come from the song-page URL's filename slug, which is
+ * reliably present even when the visible cell text is just a spacer.
+ * The slug is often multiply percent-encoded (e.g. %255B = %5B = "[").
+ */
+function titleFromSongUrl(href) {
+  let filename = href.split("/").pop() || "";
+  filename = filename.replace(/\.(mp3|flac|ogg)(\?.*)?$/i, "");
+  for (let i = 0; i < 4; i++) {
+    try {
+      const next = decodeURIComponent(filename);
+      if (next === filename) break;
+      filename = next;
+    } catch {
+      break;
+    }
   }
-  t = t.replace(/^[\s\-–—:.]+/, "").replace(/\s+/g, " ").trim();
-  return t;
+  filename = filename.replace(/^\[TRACK\]-?/i, "").replace(/^[-\s]+/, "").trim();
+  return filename;
 }
 
 async function fetchHtml(path, timeoutMs = FETCH_TIMEOUT_MS) {
@@ -103,12 +109,11 @@ async function fetchHtml(path, timeoutMs = FETCH_TIMEOUT_MS) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Track id encoding — the direct audio file URL, base64url-encoded    */
-/* directly, so /stream/:id needs no further network call at all.     */
+/* Track id encoding — the SONG PAGE path (still needs a second hop)   */
 /* ------------------------------------------------------------------ */
 
-function encodeTrackId(directFileUrl) {
-  return btoa(directFileUrl).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+function encodeTrackId(songPath) {
+  return btoa(songPath).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 function decodeTrackId(id) {
@@ -135,15 +140,14 @@ function firstAnchor(html) {
   return { href: m[1], text: stripTags(m[2]) };
 }
 
-function allAnchorHrefs(html) {
-  const hrefs = [];
-  const re = /<a[^>]+href="([^"]+)"/g;
+function allAnchors(html) {
+  const anchors = [];
+  const re = /<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
   let m;
-  while ((m = re.exec(html)) !== null) hrefs.push(m[1]);
-  return hrefs;
+  while ((m = re.exec(html)) !== null) anchors.push({ href: m[1], text: stripTags(m[2]) });
+  return anchors;
 }
 
-/** Anchor-wrapped <img> first (redesign may not use this); plain <img src> as fallback. */
 function extractCoverUrl(html) {
   const wrapped = /<a[^>]+href="([^"]+)"[^>]*>\s*<img\b/.exec(html);
   if (wrapped) return wrapped[1];
@@ -211,50 +215,59 @@ async function handleSearch(query) {
     }
   }
 
-  const albums = rawAlbums.map((a) => ({
+  // Fetch real covers for the top few results so search thumbnails
+  // aren't blank. Cheap: only grabs the cover, not the full track list.
+  const toFetchCover = rawAlbums.slice(0, PREVIEW_COVER_COUNT);
+  const covers = await Promise.allSettled(toFetchCover.map((a) => fetchAlbumCoverOnly(a.id)));
+
+  const albums = rawAlbums.map((a, i) => ({
     id: a.id,
     title: a.title,
     artist: "Various / Game OST",
-    artworkURL: "",
+    artworkURL: i < PREVIEW_COVER_COUNT && covers[i].status === "fulfilled" ? covers[i].value : "",
   }));
 
   return { albums, tracks: [], artists: [], playlists: [] };
 }
 
+async function fetchAlbumCoverOnly(albumId) {
+  const { html } = await fetchHtml(`/game-soundtracks/album/${albumId}`, PREVIEW_TIMEOUT_MS);
+  const contentIdx = html.indexOf('id="pageContent"');
+  const scoped = contentIdx >= 0 ? html.slice(contentIdx) : html;
+  const firstTableMatch = scoped.match(/<table[^>]*>[\s\S]*?<\/table>/);
+  return firstTableMatch ? extractCoverUrl(firstTableMatch[0]) : extractCoverUrl(scoped);
+}
+
 /* ------------------------------------------------------------------ */
-/* Album — format-driven track extraction, no per-song page hop        */
+/* Album — track titles from URL slug, ids encode the song-page path   */
 /* ------------------------------------------------------------------ */
 
 function parseAlbumTracks(scopedHtml) {
   const rows = scopedHtml.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || [];
   const tracks = [];
-  const seenUrls = new Set();
+  const seenPaths = new Set();
   let index = 1;
 
   for (const row of rows) {
-    const hrefs = allAnchorHrefs(row).filter((h) => AUDIO_EXT_RE.test(h));
-    if (hrefs.length === 0) continue; // not a track row
+    const anchors = allAnchors(row).filter((a) => AUDIO_EXT_RE.test(a.href));
+    if (anchors.length === 0) continue;
 
-    // Pick the best available format for this track per preference order.
-    let chosen = null;
-    for (const ext of FORMAT_PREFERENCE) {
-      const match = hrefs.find((h) => new RegExp(`\\.${ext}(\\?.*)?$`, "i").test(h));
-      if (match) { chosen = { url: match, format: ext }; break; }
-    }
-    if (!chosen) chosen = { url: hrefs[0], format: (hrefs[0].split(".").pop() || "mp3").toLowerCase() };
-    if (seenUrls.has(chosen.url)) continue;
-    seenUrls.add(chosen.url);
+    const songPath = anchors[0].href;
+    if (seenPaths.has(songPath)) continue;
+    seenPaths.add(songPath);
 
-    const cells = extractTdCells(row);
-    let title = cells.length ? stripTags(cells[0]) : "";
-    title = cleanTrackTitle(title);
-    if (!title) continue; // header/footer rows with no real title
+    // Prefer real visible anchor text if it looks like an actual title;
+    // otherwise derive it from the URL slug (reliable even when the
+    // cell text is just a spacer, which is what we saw in practice).
+    const visibleText = anchors.find((a) => a.text && a.text.trim() && a.text.trim() !== "&nbsp;")?.text;
+    const title = (visibleText && visibleText.trim()) || titleFromSongUrl(songPath);
+    if (!title) continue;
 
     tracks.push({
-      id: encodeTrackId(chosen.url),
+      id: encodeTrackId(songPath),
       title,
       trackNumber: index++,
-      format: chosen.format,
+      format: "audio",
     });
   }
 
@@ -294,15 +307,26 @@ async function handleAlbum(albumId) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Stream — no network call at all; the direct URL is already encoded */
-/* into the track id from the album parse step.                       */
+/* Stream — TWO-HOP resolution: song page path -> real direct file URL */
 /* ------------------------------------------------------------------ */
 
 async function handleStream(trackId) {
-  const url = decodeTrackId(trackId);
-  const extMatch = url.match(/\.(mp3|flac|ogg)(\?.*)?$/i);
-  const format = extMatch ? extMatch[1].toLowerCase() : "mp3";
-  return { url, format, quality: "native" };
+  const songPath = decodeTrackId(trackId);
+  const { finalUrl, html } = await fetchHtml(songPath);
+  if (/\/404$/.test(finalUrl)) throw new Error("Song page not found (404)");
+
+  const anchors = allAnchors(html);
+  const directLinks = anchors.map((a) => a.href).filter((href) => DIRECT_FILE_RE.test(href));
+  if (directLinks.length === 0) throw new Error("No direct file link found for this track");
+
+  const preferred =
+    directLinks.find((l) => /\.flac$/i.test(l)) ||
+    directLinks.find((l) => /\.ogg$/i.test(l)) ||
+    directLinks.find((l) => /\.mp3$/i.test(l)) ||
+    directLinks[0];
+
+  const extMatch = preferred.match(/\.(mp3|flac|ogg)(\?.*)?$/i);
+  return { url: preferred, format: extMatch ? extMatch[1].toLowerCase() : "mp3", quality: "native" };
 }
 
 /* ------------------------------------------------------------------ */
@@ -356,7 +380,7 @@ function manifest(token) {
   return {
     id: token ? `com.eclipse-addons.khinsider.${token}` : "com.eclipse-addons.khinsider",
     name: "KHInsider",
-    version: "1.5.0",
+    version: "1.6.0",
     description: "Video game soundtracks from downloads.khinsider.com — MP3, FLAC, and OGG rips.",
     icon: "https://downloads.khinsider.com/favicon.ico",
     resources: ["search", "stream", "catalog"],
@@ -484,7 +508,12 @@ export default {
       if (rest === "/debug") {
         const q = url.searchParams.get("q");
         const albumId = url.searchParams.get("album");
+        const trackId = url.searchParams.get("track");
         try {
+          if (trackId) {
+            const result = await handleStream(trackId);
+            return json({ ok: true, mode: "stream", result });
+          }
           if (albumId) {
             const result = await handleAlbum(albumId);
             return json({ ok: true, mode: "album", result });
