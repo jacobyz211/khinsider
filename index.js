@@ -1,18 +1,25 @@
 /**
  * Eclipse Music addon — KHInsider (downloads.khinsider.com)
  *
- * SEARCH FIX (this version):
- * The previous version's table-matching regex required class="albumList"
- * as an EXACT attribute value. If the real page has multiple classes
- * (e.g. class="albumList clickable") or different attribute ordering,
- * that regex silently matches nothing — which is almost certainly why
- * results disappeared entirely. Fixed to:
- *   1. Match class attributes containing "albumList" anywhere in the
- *      value, not just as an exact match.
- *   2. Fall back to a looser site-wide anchor scan (matching any link
- *      to /game-soundtracks/album/<id> with text) if the strict table
- *      parse comes back empty — so a markup mismatch degrades to
- *      "less precise" instead of "zero results."
+ * FIXES THIS VERSION:
+ * 1. Search album objects were missing the "artist" field entirely
+ *    after the previous preview-track rewrite. Eclipse's client model
+ *    almost certainly requires it on every catalog item — a MISSING
+ *    field (not just an empty one) is likely why results stopped
+ *    rendering in Eclipse even though the raw JSON looked fine.
+ *    Restored artist: "Various / Game OST" on every album object, and
+ *    removed the preview-tracks feature entirely (not needed).
+ * 2. artworkURL now defaults to "" instead of undefined everywhere —
+ *    JSON.stringify silently DROPS keys whose value is undefined,
+ *    which means the key disappears from the response entirely rather
+ *    than being present-but-empty. Consistently present keys are
+ *    safer for a client parser than keys that sometimes exist and
+ *    sometimes don't.
+ * 3. Album track parsing now has the same strict-then-loose-fallback
+ *    pattern already applied to search: if table#songlist doesn't
+ *    match (markup mismatch), fall back to scanning the album's
+ *    #pageContent for any link pointing under this album's own path,
+ *    so tracks still populate instead of coming back empty.
  *
  * Deploy: wrangler deploy
  * Secrets (optional): wrangler secret put UPSTASH_REDIS_REST_URL
@@ -23,8 +30,6 @@ import { Redis } from "@upstash/redis/cloudflare";
 
 const BASE_URL = "https://downloads.khinsider.com";
 const FETCH_TIMEOUT_MS = 4000;
-const PREVIEW_TIMEOUT_MS = 3000;
-const PREVIEW_COUNT = 5;
 
 const CACHE_TTL_SEARCH = 60 * 15;
 const CACHE_TTL_ALBUM = 60 * 60 * 6;
@@ -112,9 +117,17 @@ function firstAnchor(html) {
   return { href: m[1], text: stripTags(m[2]) };
 }
 
+function allAnchors(html) {
+  const anchors = [];
+  const re = /<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+  let m;
+  while ((m = re.exec(html)) !== null) anchors.push({ href: m[1], text: stripTags(m[2]) });
+  return anchors;
+}
+
 function extractCoverHref(html) {
   const m = /<a[^>]+href="([^"]+)"[^>]*>\s*<img\b/.exec(html);
-  return m ? m[1] : undefined;
+  return m ? m[1] : "";
 }
 
 /* ------------------------------------------------------------------ */
@@ -124,7 +137,7 @@ function extractCoverHref(html) {
 function parseAlbumListTable(tableHtml) {
   const rows = tableHtml.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || [];
   const albums = [];
-  for (let i = 1; i < rows.length; i++) { // skip header row
+  for (let i = 1; i < rows.length; i++) {
     const cells = extractTdCells(rows[i]);
     if (cells.length < 2) continue;
     const anchor = firstAnchor(cells[1]);
@@ -137,7 +150,6 @@ function parseAlbumListTable(tableHtml) {
   return albums;
 }
 
-/** Fallback: scan the whole page for any album link, no table structure assumed. */
 function parseAlbumLinksLoose(html) {
   const albums = [];
   const seen = new Set();
@@ -159,67 +171,87 @@ async function handleSearch(query) {
   const { html, finalUrl } = await fetchHtml(`/search?search=${encodeURIComponent(query)}`);
 
   const redirectMatch = finalUrl.match(/\/game-soundtracks\/album\/([^\/?#]+)/);
-  let albums = [];
+  let rawAlbums = [];
 
   if (redirectMatch) {
-    albums = [{ id: redirectMatch[1], title: query }];
+    rawAlbums = [{ id: redirectMatch[1], title: query }];
   } else {
-    // Class attribute may contain extra classes or different attribute
-    // ordering — match "albumList" appearing anywhere in class="...".
     const tables = html.match(/<table\b[^>]*\bclass="[^"]*albumList[^"]*"[^>]*>[\s\S]*?<\/table>/g) || [];
     const seen = new Set();
     for (const table of tables) {
       for (const a of parseAlbumListTable(table)) {
         if (seen.has(a.id)) continue;
         seen.add(a.id);
-        albums.push(a);
+        rawAlbums.push(a);
       }
     }
-    // Strict table parse found nothing (markup mismatch) — degrade
-    // gracefully to a loose site-wide scan instead of zero results.
-    if (albums.length === 0) {
-      albums = parseAlbumLinksLoose(html);
+    if (rawAlbums.length === 0) {
+      rawAlbums = parseAlbumLinksLoose(html);
     }
   }
 
-  const toPreview = albums.slice(0, PREVIEW_COUNT);
-  const previews = await Promise.allSettled(toPreview.map((a) => fetchAlbumPreview(a.id)));
+  // Every album object always carries the same fields, always with
+  // concrete (non-undefined) values, so nothing gets silently dropped
+  // by JSON.stringify or rejected by the client for a missing field.
+  const albums = rawAlbums.map((a) => ({
+    id: a.id,
+    title: a.title,
+    artist: "Various / Game OST",
+    artworkURL: "",
+  }));
 
-  const enriched = albums.map((a, i) => {
-    if (i < PREVIEW_COUNT && previews[i].status === "fulfilled") {
-      const p = previews[i].value;
-      return { ...a, artworkURL: p.artworkURL, previewTracks: p.previewTracks };
-    }
-    return { ...a, artworkURL: undefined, previewTracks: [] };
-  });
-
-  return { albums: enriched, tracks: [], artists: [], playlists: [] };
+  return { albums, tracks: [], artists: [], playlists: [] };
 }
 
-async function fetchAlbumPreview(albumId) {
-  const { html } = await fetchHtml(`/game-soundtracks/album/${albumId}`, PREVIEW_TIMEOUT_MS);
-  const contentIdx = html.indexOf('id="pageContent"');
-  const scoped = contentIdx >= 0 ? html.slice(contentIdx) : html;
+/* ------------------------------------------------------------------ */
+/* Album — strict table parse first, loose anchor scan as fallback     */
+/* ------------------------------------------------------------------ */
 
-  const firstTableMatch = scoped.match(/<table[^>]*>[\s\S]*?<\/table>/);
-  const artworkURL = firstTableMatch ? extractCoverHref(firstTableMatch[0]) : undefined;
-
-  const songlistMatch = scoped.match(/<table\b[^>]*\bid="songlist"[^>]*>[\s\S]*?<\/table>/i);
-  const rows = songlistMatch ? (songlistMatch[0].match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || []) : [];
-  const previewTracks = [];
+function parseAlbumTracksStrict(scopedHtml, albumUrl) {
+  const songlistMatch = scopedHtml.match(/<table\b[^>]*\bid="songlist"[^>]*>[\s\S]*?<\/table>/i);
+  if (!songlistMatch) return [];
+  const rows = songlistMatch[0].match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || [];
+  const tracks = [];
+  let index = 1;
   for (const row of rows) {
     if (/<th/i.test(row)) continue;
     const anchor = firstAnchor(row);
-    if (anchor && anchor.text) previewTracks.push(anchor.text);
-    if (previewTracks.length >= 3) break;
+    if (!anchor || !anchor.text) continue;
+    const songPath = anchor.href.startsWith("http") ? anchor.href : new URL(anchor.href, albumUrl).toString();
+    tracks.push({ id: encodeTrackId(songPath), title: anchor.text, trackNumber: index++, format: "audio" });
   }
-
-  return { artworkURL, previewTracks };
+  return tracks;
 }
 
-/* ------------------------------------------------------------------ */
-/* Album — full track list                                             */
-/* ------------------------------------------------------------------ */
+/**
+ * Fallback: scan the whole #pageContent region for any link whose path
+ * sits directly under this album's own path (i.e., a per-song page),
+ * excluding the album page's own self-link and any external links.
+ * Used only if the strict table#songlist selector doesn't match.
+ */
+function parseAlbumTracksLoose(scopedHtml, albumUrl, albumId) {
+  const albumPathPrefix = `/game-soundtracks/album/${albumId}/`;
+  const anchors = allAnchors(scopedHtml);
+  const tracks = [];
+  const seen = new Set();
+  let index = 1;
+  for (const a of anchors) {
+    if (!a.text) continue;
+    let path;
+    try {
+      path = a.href.startsWith("http") ? new URL(a.href).pathname : a.href;
+    } catch {
+      continue;
+    }
+    if (!path.startsWith(albumPathPrefix)) continue;
+    if (path === albumPathPrefix) continue; // self-link back to album
+    if (seen.has(path)) continue;
+    seen.add(path);
+    const songPath = a.href.startsWith("http") ? a.href : new URL(a.href, albumUrl).toString();
+    tracks.push({ id: encodeTrackId(songPath), title: a.text, trackNumber: index++, format: "audio" });
+  }
+  return tracks;
+}
 
 function parseAlbumPage(html, albumId) {
   const contentIdx = html.indexOf('id="pageContent"');
@@ -234,29 +266,22 @@ function parseAlbumPage(html, albumId) {
   const title = titleMatch ? stripTags(titleMatch[1]) : albumId;
 
   const firstTableMatch = scoped.match(/<table[^>]*>[\s\S]*?<\/table>/);
-  const artworkURL = firstTableMatch ? extractCoverHref(firstTableMatch[0]) : undefined;
+  const artworkURL = firstTableMatch ? extractCoverHref(firstTableMatch[0]) : "";
 
-  const songlistMatch = scoped.match(/<table\b[^>]*\bid="songlist"[^>]*>[\s\S]*?<\/table>/i);
-  const songlistHtml = songlistMatch ? songlistMatch[0] : "";
-  const rows = songlistHtml.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || [];
-
-  const tracks = [];
-  let index = 1;
   const albumUrl = `${BASE_URL}/game-soundtracks/album/${albumId}`;
-  for (const row of rows) {
-    if (/<th/i.test(row)) continue;
-    const anchor = firstAnchor(row);
-    if (!anchor || !anchor.text) continue;
-    const songPath = anchor.href.startsWith("http") ? anchor.href : new URL(anchor.href, albumUrl).toString();
-    tracks.push({
-      id: encodeTrackId(songPath),
-      title: anchor.text,
-      trackNumber: index++,
-      format: "audio",
-    });
+  let tracks = parseAlbumTracksStrict(scoped, albumUrl);
+  if (tracks.length === 0) {
+    tracks = parseAlbumTracksLoose(scoped, albumUrl, albumId);
   }
 
-  return { id: albumId, title, artist: "Various / Game OST", artworkURL, trackCount: tracks.length, tracks };
+  return {
+    id: albumId,
+    title,
+    artist: "Various / Game OST",
+    artworkURL,
+    trackCount: tracks.length,
+    tracks,
+  };
 }
 
 async function handleAlbum(albumId) {
@@ -338,7 +363,7 @@ function manifest(token) {
   return {
     id: token ? `com.eclipse-addons.khinsider.${token}` : "com.eclipse-addons.khinsider",
     name: "KHInsider",
-    version: "1.2.0",
+    version: "1.3.0",
     description: "Video game soundtracks from downloads.khinsider.com — MP3, FLAC, and OGG rips.",
     icon: "https://downloads.khinsider.com/favicon.ico",
     resources: ["search", "stream", "catalog"],
