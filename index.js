@@ -1,25 +1,28 @@
 /**
  * Eclipse Music addon — KHInsider (downloads.khinsider.com)
  *
- * CRITICAL FIX THIS VERSION:
- * The Redis cache was caching EMPTY search results from earlier broken
- * versions of this addon. Since cache keys are just the query text and
- * TTL is 15 minutes, re-testing the same queries ("suzume", "attack on
- * titan", "meow") kept returning those stale empty results — masking
- * every fix since, because the cache answered before the (now-working)
- * scraper ever ran again. Confirmed by wall-clock time in logs: real
- * scrapes take ~900-1000ms, but the empty results were returning in
- * 6-53ms with cpuTimeMs:0 — a pure cache hit, not a real search.
+ * MAJOR FIX THIS VERSION:
+ * The original reference scraper (obskyr/khinsider, 2014) assumed a
+ * two-hop structure: album page -> per-song page -> direct file link.
+ * A live fetch of a current album page shows that's outdated — modern
+ * KHInsider embeds the direct MP3/FLAC download links INLINE in the
+ * track table itself (icon buttons), with no separate song page
+ * required at all. Relying on a specific table id/class to find those
+ * rows was fragile and kept coming back empty.
  *
- * Fix: withCacheIfNonEmpty() now ONLY writes to cache when the result
- * actually contains albums. A transient miss or scraper bug can never
- * get "stuck" cached and block future genuine successes for the same
- * query again.
- *
- * IMPORTANT: this fix does not retroactively clear what's ALREADY
- * cached from before. Test with a query you have NOT already tried in
- * this session (or wait out the old 15-min TTL) to see the real,
- * current behavior.
+ * New approach — format-driven, not structure-driven:
+ *  - Scan the WHOLE album page for <tr> rows that contain an anchor
+ *    whose href ends in .mp3/.flac/.ogg (any table, any id/class).
+ *  - Track title = that row's first table cell, stripped of tags and
+ *    known icon-ligature leftover tokens.
+ *  - The row's matching file links ARE the direct, final audio URLs —
+ *    no second fetch needed at all. The "track id" now encodes the
+ *    real file URL directly, so /stream/:id is instant (just a
+ *    base64 decode, no network call).
+ *  - Cover art extraction now tries anchor-wrapped-<img> first, then
+ *    falls back to any plain <img src> in the content region if no
+ *    wrapping anchor is found — the redesign may not wrap the cover
+ *    in a link at all.
  *
  * Deploy: wrangler deploy
  * Secrets (optional): wrangler secret put UPSTASH_REDIS_REST_URL
@@ -33,9 +36,13 @@ const FETCH_TIMEOUT_MS = 4000;
 
 const CACHE_TTL_SEARCH = 60 * 15;
 const CACHE_TTL_ALBUM = 60 * 60 * 6;
-const CACHE_TTL_STREAM = 60 * 60 * 24;
 
 const FORMAT_PREFERENCE = ["flac", "ogg", "mp3"];
+const AUDIO_EXT_RE = /\.(mp3|flac|ogg)(\?[^"]*)?$/i;
+
+// Known Material-Icon ligature words that can leak into title text
+// when an icon element's text content gets stripped as plain text.
+const ICON_LIGATURE_WORDS = ["get_app", "playlist_add", "audiotrack", "music_note", "file_download", "download", "play_arrow"];
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -65,7 +72,17 @@ function decodeEntities(str) {
 }
 
 function stripTags(html) {
-  return decodeEntities(html.replace(/<[^>]+>/g, "").trim());
+  return decodeEntities(html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
+}
+
+function cleanTrackTitle(rawTitle) {
+  let t = rawTitle;
+  t = t.replace(/\[[A-Z_]+\]/g, " "); // bracketed placeholders like [TRACK]
+  for (const word of ICON_LIGATURE_WORDS) {
+    t = t.replace(new RegExp(`\\b${word}\\b`, "gi"), " ");
+  }
+  t = t.replace(/^[\s\-–—:.]+/, "").replace(/\s+/g, " ").trim();
+  return t;
 }
 
 async function fetchHtml(path, timeoutMs = FETCH_TIMEOUT_MS) {
@@ -86,11 +103,12 @@ async function fetchHtml(path, timeoutMs = FETCH_TIMEOUT_MS) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Track id encoding — base64url of the song page's relative path      */
+/* Track id encoding — the direct audio file URL, base64url-encoded    */
+/* directly, so /stream/:id needs no further network call at all.     */
 /* ------------------------------------------------------------------ */
 
-function encodeTrackId(songPath) {
-  return btoa(songPath).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+function encodeTrackId(directFileUrl) {
+  return btoa(directFileUrl).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 function decodeTrackId(id) {
@@ -117,17 +135,20 @@ function firstAnchor(html) {
   return { href: m[1], text: stripTags(m[2]) };
 }
 
-function allAnchors(html) {
-  const anchors = [];
-  const re = /<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+function allAnchorHrefs(html) {
+  const hrefs = [];
+  const re = /<a[^>]+href="([^"]+)"/g;
   let m;
-  while ((m = re.exec(html)) !== null) anchors.push({ href: m[1], text: stripTags(m[2]) });
-  return anchors;
+  while ((m = re.exec(html)) !== null) hrefs.push(m[1]);
+  return hrefs;
 }
 
-function extractCoverHref(html) {
-  const m = /<a[^>]+href="([^"]+)"[^>]*>\s*<img\b/.exec(html);
-  return m ? m[1] : "";
+/** Anchor-wrapped <img> first (redesign may not use this); plain <img src> as fallback. */
+function extractCoverUrl(html) {
+  const wrapped = /<a[^>]+href="([^"]+)"[^>]*>\s*<img\b/.exec(html);
+  if (wrapped) return wrapped[1];
+  const plain = /<img[^>]+src="([^"]+)"/.exec(html);
+  return plain ? plain[1] : "";
 }
 
 /* ------------------------------------------------------------------ */
@@ -201,46 +222,42 @@ async function handleSearch(query) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Album — strict table parse first, loose anchor scan as fallback     */
+/* Album — format-driven track extraction, no per-song page hop        */
 /* ------------------------------------------------------------------ */
 
-function parseAlbumTracksStrict(scopedHtml, albumUrl) {
-  const songlistMatch = scopedHtml.match(/<table\b[^>]*\bid="songlist"[^>]*>[\s\S]*?<\/table>/i);
-  if (!songlistMatch) return [];
-  const rows = songlistMatch[0].match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || [];
+function parseAlbumTracks(scopedHtml) {
+  const rows = scopedHtml.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || [];
   const tracks = [];
+  const seenUrls = new Set();
   let index = 1;
-  for (const row of rows) {
-    if (/<th/i.test(row)) continue;
-    const anchor = firstAnchor(row);
-    if (!anchor || !anchor.text) continue;
-    const songPath = anchor.href.startsWith("http") ? anchor.href : new URL(anchor.href, albumUrl).toString();
-    tracks.push({ id: encodeTrackId(songPath), title: anchor.text, trackNumber: index++, format: "audio" });
-  }
-  return tracks;
-}
 
-function parseAlbumTracksLoose(scopedHtml, albumUrl, albumId) {
-  const albumPathPrefix = `/game-soundtracks/album/${albumId}/`;
-  const anchors = allAnchors(scopedHtml);
-  const tracks = [];
-  const seen = new Set();
-  let index = 1;
-  for (const a of anchors) {
-    if (!a.text) continue;
-    let path;
-    try {
-      path = a.href.startsWith("http") ? new URL(a.href).pathname : a.href;
-    } catch {
-      continue;
+  for (const row of rows) {
+    const hrefs = allAnchorHrefs(row).filter((h) => AUDIO_EXT_RE.test(h));
+    if (hrefs.length === 0) continue; // not a track row
+
+    // Pick the best available format for this track per preference order.
+    let chosen = null;
+    for (const ext of FORMAT_PREFERENCE) {
+      const match = hrefs.find((h) => new RegExp(`\\.${ext}(\\?.*)?$`, "i").test(h));
+      if (match) { chosen = { url: match, format: ext }; break; }
     }
-    if (!path.startsWith(albumPathPrefix)) continue;
-    if (path === albumPathPrefix) continue;
-    if (seen.has(path)) continue;
-    seen.add(path);
-    const songPath = a.href.startsWith("http") ? a.href : new URL(a.href, albumUrl).toString();
-    tracks.push({ id: encodeTrackId(songPath), title: a.text, trackNumber: index++, format: "audio" });
+    if (!chosen) chosen = { url: hrefs[0], format: (hrefs[0].split(".").pop() || "mp3").toLowerCase() };
+    if (seenUrls.has(chosen.url)) continue;
+    seenUrls.add(chosen.url);
+
+    const cells = extractTdCells(row);
+    let title = cells.length ? stripTags(cells[0]) : "";
+    title = cleanTrackTitle(title);
+    if (!title) continue; // header/footer rows with no real title
+
+    tracks.push({
+      id: encodeTrackId(chosen.url),
+      title,
+      trackNumber: index++,
+      format: chosen.format,
+    });
   }
+
   return tracks;
 }
 
@@ -257,13 +274,9 @@ function parseAlbumPage(html, albumId) {
   const title = titleMatch ? stripTags(titleMatch[1]) : albumId;
 
   const firstTableMatch = scoped.match(/<table[^>]*>[\s\S]*?<\/table>/);
-  const artworkURL = firstTableMatch ? extractCoverHref(firstTableMatch[0]) : "";
+  const artworkURL = firstTableMatch ? extractCoverUrl(firstTableMatch[0]) : extractCoverUrl(scoped);
 
-  const albumUrl = `${BASE_URL}/game-soundtracks/album/${albumId}`;
-  let tracks = parseAlbumTracksStrict(scoped, albumUrl);
-  if (tracks.length === 0) {
-    tracks = parseAlbumTracksLoose(scoped, albumUrl, albumId);
-  }
+  const tracks = parseAlbumTracks(scoped);
 
   return {
     id: albumId,
@@ -281,33 +294,15 @@ async function handleAlbum(albumId) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Stream — resolve the actual direct file URL from a song's own page  */
+/* Stream — no network call at all; the direct URL is already encoded */
+/* into the track id from the album parse step.                       */
 /* ------------------------------------------------------------------ */
 
-function parseSongFileLinks(html) {
-  const fileRe = /<a[^>]+href="(https?:\/\/[^"]+\/(?:soundtracks|ost)\/[^"]+)"[^>]*>/g;
-  const links = [];
-  let m;
-  while ((m = fileRe.exec(html)) !== null) links.push(m[1]);
-  return links;
-}
-
-function pickPreferredFile(links) {
-  for (const ext of FORMAT_PREFERENCE) {
-    const match = links.find((l) => l.toLowerCase().endsWith(`.${ext}`));
-    if (match) return { url: match, format: ext };
-  }
-  return links.length ? { url: links[0], format: (links[0].split(".").pop() || "mp3").toLowerCase() } : null;
-}
-
 async function handleStream(trackId) {
-  const songPath = decodeTrackId(trackId);
-  const { finalUrl, html } = await fetchHtml(songPath);
-  if (/\/404$/.test(finalUrl)) throw new Error("Song page not found (404)");
-  const links = parseSongFileLinks(html);
-  const picked = pickPreferredFile(links);
-  if (!picked) throw new Error("No direct file link found for this track");
-  return { url: picked.url, format: picked.format, quality: "native" };
+  const url = decodeTrackId(trackId);
+  const extMatch = url.match(/\.(mp3|flac|ogg)(\?.*)?$/i);
+  const format = extMatch ? extMatch[1].toLowerCase() : "mp3";
+  return { url, format, quality: "native" };
 }
 
 /* ------------------------------------------------------------------ */
@@ -340,22 +335,6 @@ async function rDel(redis, key) {
   memCache.delete(key);
 }
 
-async function withRedisCache(env, ctx, key, ttl, fn) {
-  const redis = getRedis(env);
-  const cached = await rGet(redis, key);
-  if (cached) return json(cached);
-  const data = await fn();
-  const writeBack = rSet(redis, key, data, ttl);
-  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(writeBack);
-  else await writeBack;
-  return json(data);
-}
-
-/**
- * Same as withRedisCache, but NEVER persists a result that looks
- * empty/failed — a transient scrape miss can no longer get "stuck"
- * cached and block a future genuine success for the same query.
- */
 async function withRedisCacheIfNonEmpty(env, ctx, key, ttl, fn, isNonEmpty) {
   const redis = getRedis(env);
   const cached = await rGet(redis, key);
@@ -377,7 +356,7 @@ function manifest(token) {
   return {
     id: token ? `com.eclipse-addons.khinsider.${token}` : "com.eclipse-addons.khinsider",
     name: "KHInsider",
-    version: "1.4.0",
+    version: "1.5.0",
     description: "Video game soundtracks from downloads.khinsider.com — MP3, FLAC, and OGG rips.",
     icon: "https://downloads.khinsider.com/favicon.ico",
     resources: ["search", "stream", "catalog"],
@@ -503,16 +482,20 @@ export default {
       }
 
       if (rest === "/debug") {
-        const q = url.searchParams.get("q") || "chrono trigger";
+        const q = url.searchParams.get("q");
+        const albumId = url.searchParams.get("album");
         try {
-          const result = await handleSearch(q);
-          return json({ ok: true, result });
+          if (albumId) {
+            const result = await handleAlbum(albumId);
+            return json({ ok: true, mode: "album", result });
+          }
+          const result = await handleSearch(q || "chrono trigger");
+          return json({ ok: true, mode: "search", result });
         } catch (err) {
           return json({ ok: false, error: err.message }, 502);
         }
       }
 
-      // Manual cache-buster while iterating: /clearcache?q=some+query
       if (rest === "/clearcache") {
         const q = url.searchParams.get("q") || "";
         const redis = getRedis(env);
@@ -544,12 +527,7 @@ export default {
 
       const streamMatch = rest.match(/^\/stream\/(.+)$/);
       if (streamMatch) {
-        const cacheKey = `khinsider:stream:${streamMatch[1]}`;
-        return withRedisCacheIfNonEmpty(
-          env, ctx, cacheKey, CACHE_TTL_STREAM,
-          () => handleStream(streamMatch[1]),
-          (data) => !!data?.url
-        );
+        return json(await handleStream(streamMatch[1]));
       }
 
       return json({ error: "Not found", path: rest }, 404);
