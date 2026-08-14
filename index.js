@@ -1,25 +1,25 @@
 /**
  * Eclipse Music addon — KHInsider (downloads.khinsider.com)
  *
- * FIXES THIS VERSION:
- * 1. Search album objects were missing the "artist" field entirely
- *    after the previous preview-track rewrite. Eclipse's client model
- *    almost certainly requires it on every catalog item — a MISSING
- *    field (not just an empty one) is likely why results stopped
- *    rendering in Eclipse even though the raw JSON looked fine.
- *    Restored artist: "Various / Game OST" on every album object, and
- *    removed the preview-tracks feature entirely (not needed).
- * 2. artworkURL now defaults to "" instead of undefined everywhere —
- *    JSON.stringify silently DROPS keys whose value is undefined,
- *    which means the key disappears from the response entirely rather
- *    than being present-but-empty. Consistently present keys are
- *    safer for a client parser than keys that sometimes exist and
- *    sometimes don't.
- * 3. Album track parsing now has the same strict-then-loose-fallback
- *    pattern already applied to search: if table#songlist doesn't
- *    match (markup mismatch), fall back to scanning the album's
- *    #pageContent for any link pointing under this album's own path,
- *    so tracks still populate instead of coming back empty.
+ * CRITICAL FIX THIS VERSION:
+ * The Redis cache was caching EMPTY search results from earlier broken
+ * versions of this addon. Since cache keys are just the query text and
+ * TTL is 15 minutes, re-testing the same queries ("suzume", "attack on
+ * titan", "meow") kept returning those stale empty results — masking
+ * every fix since, because the cache answered before the (now-working)
+ * scraper ever ran again. Confirmed by wall-clock time in logs: real
+ * scrapes take ~900-1000ms, but the empty results were returning in
+ * 6-53ms with cpuTimeMs:0 — a pure cache hit, not a real search.
+ *
+ * Fix: withCacheIfNonEmpty() now ONLY writes to cache when the result
+ * actually contains albums. A transient miss or scraper bug can never
+ * get "stuck" cached and block future genuine successes for the same
+ * query again.
+ *
+ * IMPORTANT: this fix does not retroactively clear what's ALREADY
+ * cached from before. Test with a query you have NOT already tried in
+ * this session (or wait out the old 15-min TTL) to see the real,
+ * current behavior.
  *
  * Deploy: wrangler deploy
  * Secrets (optional): wrangler secret put UPSTASH_REDIS_REST_URL
@@ -43,7 +43,7 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-const KNOWN_ROUTES = new Set(["manifest.json", "search", "stream", "album", "generate", "debug"]);
+const KNOWN_ROUTES = new Set(["manifest.json", "search", "stream", "album", "generate", "debug", "clearcache"]);
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -190,9 +190,6 @@ async function handleSearch(query) {
     }
   }
 
-  // Every album object always carries the same fields, always with
-  // concrete (non-undefined) values, so nothing gets silently dropped
-  // by JSON.stringify or rejected by the client for a missing field.
   const albums = rawAlbums.map((a) => ({
     id: a.id,
     title: a.title,
@@ -223,12 +220,6 @@ function parseAlbumTracksStrict(scopedHtml, albumUrl) {
   return tracks;
 }
 
-/**
- * Fallback: scan the whole #pageContent region for any link whose path
- * sits directly under this album's own path (i.e., a per-song page),
- * excluding the album page's own self-link and any external links.
- * Used only if the strict table#songlist selector doesn't match.
- */
 function parseAlbumTracksLoose(scopedHtml, albumUrl, albumId) {
   const albumPathPrefix = `/game-soundtracks/album/${albumId}/`;
   const anchors = allAnchors(scopedHtml);
@@ -244,7 +235,7 @@ function parseAlbumTracksLoose(scopedHtml, albumUrl, albumId) {
       continue;
     }
     if (!path.startsWith(albumPathPrefix)) continue;
-    if (path === albumPathPrefix) continue; // self-link back to album
+    if (path === albumPathPrefix) continue;
     if (seen.has(path)) continue;
     seen.add(path);
     const songPath = a.href.startsWith("http") ? a.href : new URL(a.href, albumUrl).toString();
@@ -344,6 +335,11 @@ async function rSet(redis, key, value, ttl) {
   if (memCache.size > 500) memCache.delete(memCache.keys().next().value);
 }
 
+async function rDel(redis, key) {
+  if (redis) { try { await redis.del(key); } catch {} }
+  memCache.delete(key);
+}
+
 async function withRedisCache(env, ctx, key, ttl, fn) {
   const redis = getRedis(env);
   const cached = await rGet(redis, key);
@@ -355,6 +351,24 @@ async function withRedisCache(env, ctx, key, ttl, fn) {
   return json(data);
 }
 
+/**
+ * Same as withRedisCache, but NEVER persists a result that looks
+ * empty/failed — a transient scrape miss can no longer get "stuck"
+ * cached and block a future genuine success for the same query.
+ */
+async function withRedisCacheIfNonEmpty(env, ctx, key, ttl, fn, isNonEmpty) {
+  const redis = getRedis(env);
+  const cached = await rGet(redis, key);
+  if (cached) return json(cached);
+  const data = await fn();
+  if (isNonEmpty(data)) {
+    const writeBack = rSet(redis, key, data, ttl);
+    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(writeBack);
+    else await writeBack;
+  }
+  return json(data);
+}
+
 /* ------------------------------------------------------------------ */
 /* Manifest + token routing                                            */
 /* ------------------------------------------------------------------ */
@@ -363,7 +377,7 @@ function manifest(token) {
   return {
     id: token ? `com.eclipse-addons.khinsider.${token}` : "com.eclipse-addons.khinsider",
     name: "KHInsider",
-    version: "1.3.0",
+    version: "1.4.0",
     description: "Video game soundtracks from downloads.khinsider.com — MP3, FLAC, and OGG rips.",
     icon: "https://downloads.khinsider.com/favicon.ico",
     resources: ["search", "stream", "catalog"],
@@ -498,24 +512,44 @@ export default {
         }
       }
 
+      // Manual cache-buster while iterating: /clearcache?q=some+query
+      if (rest === "/clearcache") {
+        const q = url.searchParams.get("q") || "";
+        const redis = getRedis(env);
+        await rDel(redis, `khinsider:search:${q.toLowerCase()}`);
+        return json({ cleared: `khinsider:search:${q.toLowerCase()}` });
+      }
+
       if (rest === "/manifest.json") return json(manifest(token));
 
       if (rest === "/search" || rest.startsWith("/search?")) {
         const q = url.searchParams.get("q") || "";
         const cacheKey = `khinsider:search:${q.toLowerCase()}`;
-        return withRedisCache(env, ctx, cacheKey, CACHE_TTL_SEARCH, () => handleSearch(q));
+        return withRedisCacheIfNonEmpty(
+          env, ctx, cacheKey, CACHE_TTL_SEARCH,
+          () => handleSearch(q),
+          (data) => Array.isArray(data?.albums) && data.albums.length > 0
+        );
       }
 
       const albumMatch = rest.match(/^\/album\/(.+)$/);
       if (albumMatch) {
         const cacheKey = `khinsider:album:${albumMatch[1]}`;
-        return withRedisCache(env, ctx, cacheKey, CACHE_TTL_ALBUM, () => handleAlbum(albumMatch[1]));
+        return withRedisCacheIfNonEmpty(
+          env, ctx, cacheKey, CACHE_TTL_ALBUM,
+          () => handleAlbum(albumMatch[1]),
+          (data) => Array.isArray(data?.tracks) && data.tracks.length > 0
+        );
       }
 
       const streamMatch = rest.match(/^\/stream\/(.+)$/);
       if (streamMatch) {
         const cacheKey = `khinsider:stream:${streamMatch[1]}`;
-        return withRedisCache(env, ctx, cacheKey, CACHE_TTL_STREAM, () => handleStream(streamMatch[1]));
+        return withRedisCacheIfNonEmpty(
+          env, ctx, cacheKey, CACHE_TTL_STREAM,
+          () => handleStream(streamMatch[1]),
+          (data) => !!data?.url
+        );
       }
 
       return json({ error: "Not found", path: rest }, 404);
