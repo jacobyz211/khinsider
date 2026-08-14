@@ -1,0 +1,19 @@
+{
+  "name": "eclipse-khinsider-addon",
+  "version": "1.0.0",
+  "description": "Eclipse Music addon for downloads.khinsider.com — video game soundtracks (MP3/FLAC/OGG), scraped via Cloudflare Workers",
+  "private": true,
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.34.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.78.0"
+  }
+}
